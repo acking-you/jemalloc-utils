@@ -183,6 +183,54 @@ else
     echo "✓ ghostscript found: $(which ps2pdf)"
 fi
 
+FLAMEGRAPH_PL=""
+if command -v flamegraph.pl &> /dev/null; then
+    FLAMEGRAPH_PL=$(which flamegraph.pl)
+    echo "✓ flamegraph.pl found: $FLAMEGRAPH_PL"
+elif [ -f "/usr/local/bin/flamegraph.pl" ]; then
+    FLAMEGRAPH_PL="/usr/local/bin/flamegraph.pl"
+    echo "✓ flamegraph.pl found: $FLAMEGRAPH_PL"
+else
+    echo "⚠ flamegraph.pl not found"
+    echo ""
+    echo "FlameGraph is useful for visualizing heap allocation patterns."
+    read -p "Would you like to install FlameGraph? (y/n): " -n 1 -r
+    echo ""
+    
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "Installing FlameGraph..."
+        INSTALL_DIR="/usr/local/bin"
+        TEMP_DIR=$(mktemp -d)
+        
+        if command -v git &> /dev/null; then
+            cd "$TEMP_DIR"
+            if git clone --depth 1 https://github.com/brendangregg/FlameGraph.git; then
+                if [ -w "$INSTALL_DIR" ]; then
+                    cp FlameGraph/flamegraph.pl "$INSTALL_DIR/"
+                    chmod +x "$INSTALL_DIR/flamegraph.pl"
+                    FLAMEGRAPH_PL="$INSTALL_DIR/flamegraph.pl"
+                    echo "✓ flamegraph.pl installed successfully to $INSTALL_DIR"
+                else
+                    sudo cp FlameGraph/flamegraph.pl "$INSTALL_DIR/"
+                    sudo chmod +x "$INSTALL_DIR/flamegraph.pl"
+                    FLAMEGRAPH_PL="$INSTALL_DIR/flamegraph.pl"
+                    echo "✓ flamegraph.pl installed successfully to $INSTALL_DIR (required sudo)"
+                fi
+            else
+                echo "⚠ Failed to clone FlameGraph repository"
+                echo "  You can manually install from: https://github.com/brendangregg/FlameGraph"
+            fi
+            cd - > /dev/null
+            rm -rf "$TEMP_DIR"
+        else
+            echo "⚠ git not found. Cannot install FlameGraph automatically"
+            echo "  Please install git or manually download from: https://github.com/brendangregg/FlameGraph"
+        fi
+    else
+        echo "Skipping FlameGraph installation"
+    fi
+fi
+
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
@@ -355,6 +403,16 @@ cleanup() {
         echo "  # Show detailed allocation sites with line numbers"
         echo "  jeprof --text --lines $PROGRAM $LATEST_HEAP | head -50"
         echo ""
+        
+        if [ -n "$FLAMEGRAPH_PL" ]; then
+            echo "  # Generate FlameGraph for heap allocations (total allocated)"
+            echo "  jeprof --collapsed $PROGRAM $LATEST_HEAP | $FLAMEGRAPH_PL > flamegraph.svg"
+            echo ""
+            echo "  # Generate FlameGraph for current memory usage (not cumulative)"
+            echo "  jeprof --inuse_space --collapsed $PROGRAM $LATEST_HEAP | $FLAMEGRAPH_PL > flamegraph_inuse.svg"
+            echo ""
+        fi
+        
         echo "Note: Using wildcard (jeprof.*.heap) will merge all heap files and show inflated numbers!"
     fi
     exit 0
