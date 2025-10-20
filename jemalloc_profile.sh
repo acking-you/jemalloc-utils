@@ -77,6 +77,37 @@ echo "========================================"
 echo "Checking dependencies..."
 echo "========================================"
 
+# Check for addr2line (prefer gimli-rs version for better performance)
+if command -v addr2line &> /dev/null; then
+    addr2line_path=$(which addr2line)
+    addr2line_version=$(addr2line --version 2>&1 || echo "unknown")
+    # Check if it's the fast gimli-rs version by looking for "addr2line" with version number
+    # gimli-rs version output: "addr2line 0.x.x"
+    # GNU binutils version output: "GNU addr2line (GNU Binutils) 2.x"
+    if echo "$addr2line_version" | grep -q "^addr2line [0-9]"; then
+        echo "✓ Fast addr2line (gimli-rs) is available: $addr2line_path"
+        echo "  Version: $addr2line_version"
+    else
+        echo "⚠ System addr2line found (slow): $addr2line_path"
+        echo "  Version: $addr2line_version"
+        echo ""
+        echo "For faster symbol resolution, consider installing gimli-rs addr2line:"
+        echo "  cargo install addr2line --features bin"
+        echo ""
+        echo "Performance impact:"
+        echo "  - GNU addr2line: 2-5 minutes for large heap profiles"
+        echo "  - gimli-rs addr2line: 20-60 seconds for same profiles"
+        echo ""
+    fi
+else
+    echo "⚠ addr2line not found. Symbol resolution may be limited."
+    echo ""
+    echo "addr2line is used by jeprof to resolve function names and line numbers."
+    echo "For best performance, install the fast gimli-rs version:"
+    echo "  cargo install addr2line --features bin"
+    echo ""
+fi
+
 # Check and install jeprof if needed
 if ! command -v jeprof &> /dev/null; then
     echo "jeprof not found. Attempting to install..."
