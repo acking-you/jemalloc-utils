@@ -5,7 +5,7 @@ set -e
 OUTPUT_DIR="./jeprof_output"
 PROF_ACTIVE=true
 ABORT_ON_ERROR=true
-INTERVAL_MB=""
+INTERVAL_MB="500"  # Default: dump every 500MB allocated
 
 usage() {
     echo "Usage: $0 [options] -- <program> [program_args...]"
@@ -14,14 +14,14 @@ usage() {
     echo "  -o, --output DIR          Output directory for profile files (default: ./jeprof_output)"
     echo "  -a, --active BOOL         Enable profiling at startup (default: true)"
     echo "  -c, --abort-on-error BOOL Abort if jemalloc profiling not available (default: true)"
-    echo "  -i, --interval-mb NUM     Dump profile every NUM MB allocated (optional, e.g., 100, 512, 1024)"
+    echo "  -i, --interval-mb NUM     Dump profile every NUM MB allocated (default: 500)"
     echo "  -h, --help                Show this help message"
     echo ""
     echo "Example:"
-    echo "  # Only dump on exit"
+    echo "  # Use default interval (500MB)"
     echo "  $0 -o /tmp/profiles -- ./bin/my_program arg1 arg2"
     echo ""
-    echo "  # Dump every 512MB allocated + final dump on exit"
+    echo "  # Dump every 512MB allocated"
     echo "  $0 -o /tmp/profiles -i 512 -- ./bin/my_program arg1 arg2"
     echo ""
     exit 1
@@ -276,29 +276,22 @@ echo "Output directory: $OUTPUT_DIR"
 echo "Profile prefix: $PROF_PREFIX"
 echo "Profiling active: $PROF_ACTIVE"
 echo "Abort on error: $ABORT_ON_ERROR"
-if [ -n "$INTERVAL_MB" ]; then
-    echo "Interval: Dump every ${INTERVAL_MB}MB allocated"
-else
-    echo "Interval: Only dump on exit"
-fi
+echo "Interval: Dump every ${INTERVAL_MB}MB allocated"
 echo "========================================"
 echo ""
 
 # Configure MALLOC_CONF
 # abort_conf:true will cause jemalloc to abort if any conf option is invalid or unavailable
-# prof_final:true generates a final dump on exit
 # lg_prof_interval:N triggers a dump every 2^N bytes allocated
-# lg_prof_sample uses default (19, which is 2^19 = 512KB sampling interval)
+# lg_prof_sample:19 means sample every 2^19 = 512KB allocated
 
-MALLOC_CONF_BASE="prof:true,prof_active:${PROF_ACTIVE},prof_prefix:${PROF_PREFIX},prof_final:true,lg_prof_sample:19"
+MALLOC_CONF_BASE="prof:true,prof_active:${PROF_ACTIVE},prof_prefix:${PROF_PREFIX},lg_prof_sample:19"
 
-if [ -n "$INTERVAL_MB" ]; then
-    # Convert MB to bytes and calculate lg
-    BYTES=$((INTERVAL_MB * 1024 * 1024))
-    LG_PROF_INTERVAL=$(echo "l($BYTES)/l(2)" | bc -l | awk '{printf "%.0f\n", $1}')
-    echo "Calculated lg_prof_interval: $LG_PROF_INTERVAL (2^$LG_PROF_INTERVAL = ~${INTERVAL_MB}MB)"
-    MALLOC_CONF_BASE="${MALLOC_CONF_BASE},lg_prof_interval:${LG_PROF_INTERVAL}"
-fi
+# Convert MB to bytes and calculate lg
+BYTES=$((INTERVAL_MB * 1024 * 1024))
+LG_PROF_INTERVAL=$(echo "l($BYTES)/l(2)" | bc -l | awk '{printf "%.0f\n", $1}')
+echo "Calculated lg_prof_interval: $LG_PROF_INTERVAL (2^$LG_PROF_INTERVAL = ~${INTERVAL_MB}MB)"
+MALLOC_CONF_BASE="${MALLOC_CONF_BASE},lg_prof_interval:${LG_PROF_INTERVAL}"
 
 if [ "$ABORT_ON_ERROR" = "true" ]; then
     export MALLOC_CONF="abort_conf:true,${MALLOC_CONF_BASE}"
@@ -355,6 +348,63 @@ echo ""
 echo "Program is running. Press Ctrl+C to stop and generate final heap dump."
 echo ""
 
+show_analysis_tips() {
+    local output_dir="$1"
+    local program="$2"
+
+    HEAP_FILES=$(ls "$output_dir"/jeprof.*.heap 2>/dev/null | wc -l)
+
+    if [ "$HEAP_FILES" -eq 0 ]; then
+        echo "⚠ Warning: No heap profile files were generated!"
+        echo ""
+        echo "Possible reasons:"
+        echo "  1. Program exited before heap dump could be written"
+        echo "  2. No memory allocations occurred"
+        echo "  3. Jemalloc profiling was not properly configured"
+        echo ""
+    else
+        echo "✓ Generated $HEAP_FILES heap profile file(s) in: $output_dir"
+        echo ""
+
+        # Find the latest heap file
+        LATEST_HEAP=$(ls -t "$output_dir"/jeprof.*.heap 2>/dev/null | head -1)
+
+        echo "To analyze results:"
+        echo "  # Analyze latest heap file (recommended)"
+        echo "  jeprof --text $program $LATEST_HEAP | head -30"
+        echo ""
+        echo "  # View current memory usage (not cumulative)"
+        echo "  jeprof --inuse_space --text $program $LATEST_HEAP | head -30"
+        echo ""
+        echo "  # Generate PDF call graph"
+        echo "  jeprof --pdf --drop_negative $program $LATEST_HEAP > profile.pdf"
+        echo ""
+        echo "  # Generate SVG call graph"
+        echo "  jeprof --svg --drop_negative $program $LATEST_HEAP > profile.svg"
+        echo ""
+        echo "  # Generate simplified graph (top 30 nodes only)"
+        echo "  jeprof --svg --nodecount=30 --drop_negative $program $LATEST_HEAP > profile_simple.svg"
+        echo ""
+        echo "  # Verify symbols from all libraries (arrow, brpc, redis, rocksdb, etc.)"
+        echo "  jeprof --text $program $LATEST_HEAP | grep -E '(arrow|brpc|redis|rocksdb|parquet)'"
+        echo ""
+        echo "  # Show detailed allocation sites with line numbers"
+        echo "  jeprof --text --lines $program $LATEST_HEAP | head -50"
+        echo ""
+
+        if [ -n "$FLAMEGRAPH_PL" ]; then
+            echo "  # Generate FlameGraph for heap allocations (total allocated)"
+            echo "  jeprof --collapsed $program $LATEST_HEAP | $FLAMEGRAPH_PL > flamegraph.svg"
+            echo ""
+            echo "  # Generate FlameGraph for current memory usage (not cumulative)"
+            echo "  jeprof --inuse_space --collapsed $program $LATEST_HEAP | $FLAMEGRAPH_PL > flamegraph_inuse.svg"
+            echo ""
+        fi
+
+        echo "Note: Using wildcard (jeprof.*.heap) will merge all heap files and show inflated numbers!"
+    fi
+}
+
 cleanup() {
     echo ""
     echo "Received termination signal. Generating heap dump..."
@@ -394,58 +444,8 @@ cleanup() {
     kill -TERM $PID 2>/dev/null || true
     wait $PID 2>/dev/null || true
     echo ""
-    
-    HEAP_FILES=$(ls "$OUTPUT_DIR"/jeprof.*.heap 2>/dev/null | wc -l)
-    
-    if [ "$HEAP_FILES" -eq 0 ]; then
-        echo "⚠ Warning: No heap profile files were generated!"
-        echo ""
-        echo "Possible reasons:"
-        echo "  1. Program exited before heap dump could be written"
-        echo "  2. No memory allocations occurred"
-        echo "  3. Jemalloc profiling was not properly configured"
-        echo ""
-    else
-        echo "✓ Generated $HEAP_FILES heap profile file(s) in: $OUTPUT_DIR"
-        echo ""
-        
-        # Find the latest heap file
-        LATEST_HEAP=$(ls -t "$OUTPUT_DIR"/jeprof.*.heap 2>/dev/null | head -1)
-        
-        echo "To analyze results:"
-        echo "  # Analyze latest heap file (recommended)"
-        echo "  jeprof --text $PROGRAM $LATEST_HEAP | head -30"
-        echo ""
-        echo "  # View current memory usage (not cumulative)"
-        echo "  jeprof --inuse_space --text $PROGRAM $LATEST_HEAP | head -30"
-        echo ""
-        echo "  # Generate PDF call graph"
-        echo "  jeprof --pdf --drop_negative $PROGRAM $LATEST_HEAP > profile.pdf"
-        echo ""
-        echo "  # Generate SVG call graph"
-        echo "  jeprof --svg --drop_negative $PROGRAM $LATEST_HEAP > profile.svg"
-        echo ""
-        echo "  # Generate simplified graph (top 30 nodes only)"
-        echo "  jeprof --svg --nodecount=30 --drop_negative $PROGRAM $LATEST_HEAP > profile_simple.svg"
-        echo ""
-        echo "  # Verify symbols from all libraries (arrow, brpc, redis, rocksdb, etc.)"
-        echo "  jeprof --text $PROGRAM $LATEST_HEAP | grep -E '(arrow|brpc|redis|rocksdb|parquet)'"
-        echo ""
-        echo "  # Show detailed allocation sites with line numbers"
-        echo "  jeprof --text --lines $PROGRAM $LATEST_HEAP | head -50"
-        echo ""
-        
-        if [ -n "$FLAMEGRAPH_PL" ]; then
-            echo "  # Generate FlameGraph for heap allocations (total allocated)"
-            echo "  jeprof --collapsed $PROGRAM $LATEST_HEAP | $FLAMEGRAPH_PL > flamegraph.svg"
-            echo ""
-            echo "  # Generate FlameGraph for current memory usage (not cumulative)"
-            echo "  jeprof --inuse_space --collapsed $PROGRAM $LATEST_HEAP | $FLAMEGRAPH_PL > flamegraph_inuse.svg"
-            echo ""
-        fi
-        
-        echo "Note: Using wildcard (jeprof.*.heap) will merge all heap files and show inflated numbers!"
-    fi
+
+    show_analysis_tips "$OUTPUT_DIR" "$PROGRAM"
     exit 0
 }
 
@@ -456,14 +456,6 @@ wait $PID 2>/dev/null || true
 
 echo ""
 echo "Program exited normally. Profile files saved in: $OUTPUT_DIR"
+echo ""
 
-# Show final file count
-HEAP_FILES=$(ls "$OUTPUT_DIR"/jeprof.*.heap 2>/dev/null | wc -l)
-if [ "$HEAP_FILES" -gt 0 ]; then
-    echo "✓ Generated $HEAP_FILES heap profile file(s)"
-    echo ""
-    echo "To analyze results:"
-    echo "  jeprof --text $PROGRAM $OUTPUT_DIR/jeprof.*.heap | head -30"
-else
-    echo "⚠ No heap profile files were generated"
-fi
+show_analysis_tips "$OUTPUT_DIR" "$PROGRAM"
